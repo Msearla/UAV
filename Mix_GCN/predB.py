@@ -5,9 +5,108 @@ import numpy as np
 import pickle
 import yaml
 from tqdm import tqdm
+import random
 
 # 添加模型代码所在的路径
 sys.path.append('./model')
+
+def init_seed(seed):
+    """初始化随机种子，确保结果可重复"""
+    torch.cuda.manual_seed_all(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def import_class(import_str):
+    """动态导入类"""
+    mod_str, _sep, class_str = import_str.rpartition('.')
+    __import__(mod_str)
+    try:
+        return getattr(sys.modules[mod_str], class_str)
+    except AttributeError:
+        raise ImportError('Class %s cannot be found' % class_str)
+
+# 导入 tools.py 中的函数
+from dataset.tools import valid_crop_resize
+
+def preprocess_data(data_paths, window_size=64, p_interval=[0.95]):
+    """使用与训练相同的预处理步骤处理数据"""
+    # COCO关键点对，用于计算骨骼特征
+    coco_pairs = [
+        (1, 6), (2, 1), (3, 1), (4, 2), (5, 3), (6, 7),
+        (7, 1), (8, 6), (9, 7), (10, 8), (11, 9),
+        (12, 6), (13, 7), (14, 12), (15, 13), (16, 14), (17, 15)
+    ]
+
+    processed_data = {}
+    for key, path in data_paths.items():
+        if os.path.exists(path):
+            print(f"\nProcessing {key} data from {path}")
+
+            # 直接加载npy文件
+            data = np.load(path)  # [N, C, T, V, M] format
+            print(f"Original data shape: {data.shape}")
+
+            N, C, T, V, M = data.shape
+
+            # 根据数据类型设置参数
+            is_bone = 'B' in key and 'M' not in key  # 骨骼数据
+            is_vel = 'M' in key  # 运动数据
+
+            # 初始化处理后的数据列表
+            processed_samples = []
+
+            for idx in tqdm(range(N), desc=f"Processing {key} data"):
+                data_numpy = data[idx]  # [C, T, V, M]
+
+                # 计算有效帧数 (不全为0的帧)
+                valid_frame_mask = (data_numpy.sum(axis=(0, 2, 3)) != 0)
+                valid_frame_num = valid_frame_mask.sum()
+
+                if valid_frame_num == 0:
+                    # 如果所有帧都是无效的，返回全零张量
+                    data_tensor = np.zeros(
+                        (C, window_size, V, M),
+                        dtype=np.float32
+                    )
+                else:
+                    # 使用 valid_crop_resize 进行裁剪和调整大小
+                    data_tensor = valid_crop_resize(
+                        data_numpy,
+                        int(valid_frame_num),
+                        p_interval,
+                        window_size
+                    )  # 返回的是 numpy 数组
+
+                if is_bone:
+                    # 计算骨骼数据
+                    bone_data = np.zeros_like(data_tensor)
+                    for v1, v2 in coco_pairs:
+                        bone_data[:, :, v1 - 1] = data_tensor[:, :, v1 - 1] - data_tensor[:, :, v2 - 1]
+                    data_tensor = bone_data
+
+                if is_vel:
+                    # 计算速度（帧间差分）
+                    vel_data = np.zeros_like(data_tensor)
+                    vel_data[:, :-1] = data_tensor[:, 1:] - data_tensor[:, :-1]
+                    vel_data[:, -1] = 0
+                    data_tensor = vel_data
+
+                # 归一化：所有关节相对于第一个关节（通常是根关节）
+                data_tensor = data_tensor - data_tensor[:, :, 0:1, :]  # all_joint - root_joint
+
+                processed_samples.append(data_tensor)
+
+            # 将处理后的数据堆叠起来
+            processed_data[key] = np.stack(processed_samples)
+            print(f"Processed {key} data shape: {processed_data[key].shape}")
+        else:
+            print(f"Data file {path} does not exist.")
+            processed_data[key] = None
+
+    return processed_data
 
 def load_model(model_name, model_weights_path, model_config_path, device):
     # 根据模型名称导入模型代码
@@ -26,8 +125,8 @@ def load_model(model_name, model_weights_path, model_config_path, device):
 
     # 获取模型参数
     model_args = config.get('model_args', {})
-    model_args['num_class'] = config.get('num_class', 155)  # 根据您的数据集类别数量
-    model_args['in_channels'] = 3  # 一般情况下为3
+    model_args['num_class'] = config.get('num_class', 155)
+    model_args['in_channels'] = 3
 
     # 初始化模型
     model = Model(**model_args)
@@ -47,7 +146,7 @@ def predict(model, data, batch_size=64):
 
     with torch.no_grad():
         for i in tqdm(range(0, num_samples, batch_size), desc='Predicting'):
-            batch_data = data[i:i+batch_size]
+            batch_data = data[i:i + batch_size]
             batch_data = torch.tensor(batch_data).float().to(device)
             outputs = model(batch_data)
             predictions.append(outputs.cpu().numpy())
@@ -56,6 +155,9 @@ def predict(model, data, batch_size=64):
     return predictions
 
 if __name__ == "__main__":
+    # 设置随机种子
+    init_seed(1)
+
     # 定义测试集数据路径
     data_paths = {
         'J': './TestdataB/test_B_joint.npy',
@@ -64,15 +166,8 @@ if __name__ == "__main__":
         'BM': './TestdataB/test_B_bone_motion.npy'
     }
 
-    # 加载测试集数据
-    test_data = {}
-    for key, path in data_paths.items():
-        if os.path.exists(path):
-            test_data[key] = np.load(path)
-            print(f"Loaded {key} data from {path}, shape: {test_data[key].shape}")
-        else:
-            print(f"Data file {path} does not exist.")
-            test_data[key] = None
+    # 使用与训练相同的预处理步骤处理数据
+    test_data = preprocess_data(data_paths, window_size=64, p_interval=[0.95])
 
     # 定义模型列表和对应的输入数据类型
     models_info = [
@@ -86,7 +181,7 @@ if __name__ == "__main__":
         {'name': 'mstgcn_V1_BM_3D', 'data_type': 'BM'},
         {'name': 'mstgcn_V1_J_3D', 'data_type': 'J'},
         {'name': 'mstgcn_V1_JM_3D', 'data_type': 'JM'},
-        # TD-GCN Models (没有 BM)
+        # TD-GCN Models
         {'name': 'tdgcn_V1_B_3D', 'data_type': 'B'},
         {'name': 'tdgcn_V1_J_3D', 'data_type': 'J'},
         {'name': 'tdgcn_V1_JM_3D', 'data_type': 'JM'},
@@ -104,7 +199,7 @@ if __name__ == "__main__":
 
         # 模型权重路径
         model_weights_path = f'./pt/{model_name}.pt'
-        # 模型配置文件路径（注意小写的 '3d'）
+        # 模型配置文件路径
         config_name = model_name.lower().replace('3d', '3d') + '.yaml'
         model_config_path = f'./config/{config_name}'
 
@@ -127,7 +222,6 @@ if __name__ == "__main__":
 
         # 检查数据形状
         if data.ndim == 5:
-            # 数据已经是 [N, C, T, V, M] 形状
             N, C, T, V, M = data.shape
             print(f"Data shape is correct: [N, C, T, V, M] = {data.shape}")
         else:
@@ -145,11 +239,10 @@ if __name__ == "__main__":
 
         score_files.append(score_file)
 
-    # 定义模型得分文件和对应的权重
-    # 更新 score_files 列表，确保只包含实际生成的得分文件
-    weights = [1, 1, 0.05, 0.05,
-            1, 1, 0.05, 0.05,
-            1, 1, 0.05]
+    # 模型融合权重
+    weights = [1.5, 0.05, 1.3, 0.05,
+               1.2, 0.05, 1.4, 0.05,
+               1.5, 1, 0.05]
 
     # 加权融合
     def ensemble_scores(score_files, weights):
